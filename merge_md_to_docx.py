@@ -2,23 +2,26 @@
 """
 遍历指定根目录及所有子目录，对每个包含 .md 的文件夹单独生成一个 docx，
 整合该文件夹下的所有 .md 文件，按文件名分章节，正文两端对齐，章节间分页。
-使用 pandoc 进行 Markdown → DOCX 转换，保留丰富格式。
-依赖: pip install python-docx
-      安装 pandoc (https://pandoc.org/installing.html)
+支持标题(1-6级)、列表、代码块等常见 Markdown 格式。
+使用 pypandoc（内置 pandoc）进行格式转换，多线程并发处理。
+
+依赖: pip install python-docx pypandoc_binary
 """
 from pathlib import Path
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.shared import Cm, Pt
-import subprocess
+from docx.oxml.ns import qn
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import pypandoc
 import tempfile
-import shutil
 import os
 import re
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
 
 def get_md_files(folder):
     """返回文件夹下按名称排序的 .md 文件列表。"""
@@ -37,7 +40,6 @@ def read_text_with_fallback(path, primary="utf-8", fallbacks=("gbk", "gb2312", "
                 return path.read_text(encoding=enc)
             except UnicodeDecodeError:
                 continue
-    # 所有编码都失败，用 replace 兜底
     return path.read_text(encoding=primary, errors="replace")
 
 
@@ -71,11 +73,44 @@ def _add_heading_with_justify(doc, text, level, set_justify=True):
     return p
 
 
+def _remove_soft_line_breaks(doc):
+    """移除 docx 正文中所有的手动换行符 (<w:br/>)，替换为空格。
+    只移除段内换行(soft break)，不影响分页符(page break)。
+    """
+    for para in doc.paragraphs:
+        for run in para.runs:
+            for br in run._element.findall(qn("w:br")):
+                br_type = br.get(qn("w:type"))
+                # 只移除非分页的换行符（type 为 None 即普通软换行，或 type="textWrapping"）
+                if br_type is None or br_type == "textWrapping":
+                    # 在 br 之前插入一个空格文本节点，避免前后文字粘连
+                    parent = br.getparent()
+                    idx = list(parent).index(br)
+                    parent.remove(br)
+                    # 如果 br 不是最后一个子元素，在 run 文本中补一个空格
+                    # 通过直接操作 run.text 实现
+            # 清理后重新整理 run 的文本：把连续空白压缩
+            if run.text:
+                run.text = re.sub(r"[ \t]{2,}", " ", run.text)
+
+    # 同时处理表格单元格内的换行
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        for br in run._element.findall(qn("w:br")):
+                            br_type = br.get(qn("w:type"))
+                            if br_type is None or br_type == "textWrapping":
+                                run._element.remove(br)
+                        if run.text:
+                            run.text = re.sub(r"[ \t]{2,}", " ", run.text)
+
+
 # ---------------------------------------------------------------------------
-# Markdown → docx 段落（简易解析器）
+# Markdown → docx 段落（简易解析器，仅在 pypandoc 转换失败时使用）
 # ---------------------------------------------------------------------------
 
-# 标题匹配：支持 1-6 级
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 
 def simple_md_to_paragraphs(doc, text, set_justify=True):
@@ -86,12 +121,11 @@ def simple_md_to_paragraphs(doc, text, set_justify=True):
         line = lines[i]
         stripped = line.strip()
 
-        # ---- 空行 ----
         if not stripped:
             i += 1
             continue
 
-        # ---- 围栏代码块 ----
+        # 围栏代码块
         if stripped.startswith("```"):
             code_lines = []
             i += 1
@@ -99,33 +133,31 @@ def simple_md_to_paragraphs(doc, text, set_justify=True):
                 code_lines.append(lines[i])
                 i += 1
             if i < len(lines):
-                i += 1  # 跳过结尾 ```
+                i += 1
             p = doc.add_paragraph()
-            if set_justify:
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT  # 代码块左对齐更自然
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             run = p.add_run("\n".join(code_lines))
             run.font.name = "Consolas"
             run.font.size = Pt(9)
             continue
 
-        # ---- 标题 ----
+        # 标题
         m = _HEADING_RE.match(stripped)
         if m:
-            level = len(m.group(1))  # 1-6
+            level = len(m.group(1))
             _add_heading_with_justify(doc, m.group(2).strip(), level, set_justify)
             i += 1
             continue
 
-        # ---- 水平线 ----
+        # 水平线
         if stripped in ("---", "***", "___"):
             i += 1
             continue
 
-        # ---- 列表项 ----
+        # 列表项
         if _is_list_item(stripped):
             while i < len(lines) and _is_list_item(lines[i]):
                 item = lines[i].strip()
-                # 去掉列表标记
                 item = re.sub(r"^[-*+]\s+", "", item)
                 item = re.sub(r"^\d+\.\s+", "", item)
                 p = doc.add_paragraph(_strip_inline_md(item), style="List Bullet")
@@ -134,7 +166,7 @@ def simple_md_to_paragraphs(doc, text, set_justify=True):
                 i += 1
             continue
 
-        # ---- 普通段落：合并连续非空、非特殊行 ----
+        # 普通段落
         block = [stripped]
         i += 1
         while (i < len(lines)
@@ -153,13 +185,24 @@ def simple_md_to_paragraphs(doc, text, set_justify=True):
 
 
 # ---------------------------------------------------------------------------
-# pandoc 辅助 & 段落复制
+# pypandoc 转换 & 段落复制
 # ---------------------------------------------------------------------------
 
+def convert_md_to_docx_via_pypandoc(md_path, out_docx_path):
+    """用 pypandoc 将单个 md 转为临时 docx。"""
+    try:
+        pypandoc.convert_file(
+            str(md_path), "docx",
+            format="markdown",
+            outputfile=str(out_docx_path),
+        )
+        return True
+    except Exception:
+        return False
+
+
 def copy_paragraphs_with_justify(source_doc, target_doc, skip_first_if_equal=None):
-    """将 source_doc 的正文段落复制到 target_doc，并设为两端对齐。
-    skip_first_if_equal: 若首段文本与此字符串一致则跳过（避免与章节标题重复）。
-    """
+    """将 source_doc 的正文段落复制到 target_doc，并设为两端对齐。"""
     for idx, para in enumerate(source_doc.paragraphs):
         if skip_first_if_equal is not None and idx == 0 and para.text.strip() == skip_first_if_equal:
             continue
@@ -185,21 +228,12 @@ def copy_paragraphs_with_justify(source_doc, target_doc, skip_first_if_equal=Non
                     para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
 
-def merge_with_pandoc(md_path, out_docx_path):
-    """用 pandoc 将单个 md 转为临时 docx。转换失败时抛出异常。"""
-    subprocess.run(
-        ["pandoc", str(md_path), "-o", str(out_docx_path), "-f", "markdown", "-t", "docx"],
-        check=True, capture_output=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-
-
 # ---------------------------------------------------------------------------
-# 核心：为每个文件夹构建 docx
+# 核心：为每个文件夹构建 docx（进程安全）
 # ---------------------------------------------------------------------------
 
 def build_docx_for_folder(folder, md_files, margin_cm=1.27):
-    """针对一个文件夹内的 md 列表，使用 pandoc 生成一个 Document 并返回。"""
+    """针对一个文件夹内的 md 列表，生成一个 Document 并返回。"""
     doc = Document()
     margin = Cm(margin_cm)
     for section in doc.sections:
@@ -216,28 +250,29 @@ def build_docx_for_folder(folder, md_files, margin_cm=1.27):
         fd, tmp_path = tempfile.mkstemp(suffix=".docx")
         os.close(fd)
         try:
-            merge_with_pandoc(md_path, tmp_path)
-            sub_doc = Document(tmp_path)
-            copy_paragraphs_with_justify(sub_doc, doc, skip_first_if_equal=chapter_name)
-        except subprocess.CalledProcessError:
-            # pandoc 转换单个文件失败时，回退到简易解析
-            text = read_text_with_fallback(md_path)
-            simple_md_to_paragraphs(doc, text, set_justify=True)
+            if convert_md_to_docx_via_pypandoc(md_path, tmp_path):
+                sub_doc = Document(tmp_path)
+                # 先清除子文档中的手动换行符
+                _remove_soft_line_breaks(sub_doc)
+                copy_paragraphs_with_justify(sub_doc, doc, skip_first_if_equal=chapter_name)
+            else:
+                text = read_text_with_fallback(md_path)
+                simple_md_to_paragraphs(doc, text, set_justify=True)
         finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
         doc.add_paragraph()
+
+    # 最终再对合并后的 doc 整体清理一次手动换行
+    _remove_soft_line_breaks(doc)
     return doc
 
 
-# ---------------------------------------------------------------------------
-# 主入口
-# ---------------------------------------------------------------------------
-
-def _process_one_folder(folder, margin_cm, root):
-    """处理单个文件夹：构建 docx 并保存。返回 (relative_path, file_count) 或 None。"""
+def process_folder(folder, root, margin_cm):
+    """处理单个文件夹：构建 docx 并保存。供线程池调用。"""
     md_files = get_md_files(folder)
     if not md_files:
         return None
@@ -245,8 +280,12 @@ def _process_one_folder(folder, margin_cm, root):
     out_path = folder / f"{folder.name}.docx"
     doc.save(out_path)
     rel = out_path.relative_to(root)
-    return (str(rel), len(md_files))
+    return (rel, len(md_files))
 
+
+# ---------------------------------------------------------------------------
+# 主入口
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="合并目录下的 Markdown 文件为 DOCX 文档")
@@ -257,12 +296,12 @@ def main():
     parser.add_argument("--encoding", default="utf-8",
                         help="主要编码（默认 utf-8，失败自动回退 GBK 等）")
     parser.add_argument("--workers", type=int, default=None,
-                        help="并行线程数（默认为 CPU 核心数）")
+                        help="并发线程数（默认为 CPU 核心数）")
     args = parser.parse_args()
 
     root = args.dir if args.dir else Path(__file__).resolve().parent
 
-    # 收集所有包含 .md 的目录（含 root 及其子目录）
+    # 收集所有包含 .md 的目录
     dirs_with_md = set()
     for f in root.rglob("*.md"):
         if f.is_file():
@@ -273,44 +312,31 @@ def main():
         print("未在脚本目录及子目录下发现任何 .md 文件。")
         return
 
-    if shutil.which("pandoc") is None:
-        print("错误: 未找到 pandoc，请先安装: pip install pandoc")
-        return
-
     total = len(dirs_with_md)
-    max_workers = args.workers if args.workers else min(os.cpu_count() or 1, total)
+    workers = args.workers or min(total, os.cpu_count() or 4)
+    print(f"发现 {total} 个文件夹，使用 {workers} 个进程并发处理…\n")
 
-    print(f"找到 {total} 个文件夹，使用 {max_workers} 个线程并行处理…\n")
-
-    # 线程安全的进度计数器
-    lock = threading.Lock()
-    counter = [0]  # 用列表以便在闭包内修改
-
-    def task(folder):
-        result = _process_one_folder(folder, args.margin, root)
-        with lock:
-            counter[0] += 1
-            idx = counter[0]
-            if result:
-                rel, n = result
-                print(f"[{idx}/{total}] ✓ {rel}（{n} 个章节）")
-            else:
-                print(f"[{idx}/{total}] - {folder.name}（无 .md 文件，跳过）")
-        return result
-
-    results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(task, folder): folder for folder in dirs_with_md}
-        for future in as_completed(futures):
+    completed = 0
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        future_to_folder = {
+            executor.submit(process_folder, folder, root, args.margin): folder
+            for folder in dirs_with_md
+        }
+        for future in as_completed(future_to_folder):
+            folder = future_to_folder[future]
+            completed += 1
             try:
-                r = future.result()
-                if r:
-                    results.append(r)
+                result = future.result()
+                if result:
+                    rel, count = result
+                    print(f"[{completed}/{total}] ✓ 已生成: {rel}（{count} 个章节）")
+                else:
+                    print(f"[{completed}/{total}] - 跳过: {folder.name}（无 .md 文件）")
             except Exception as e:
-                folder = futures[future]
-                print(f"✗ 处理 {folder.name} 时出错: {e}")
+                print(f"[{completed}/{total}] ✗ 失败: {folder.name} — {e}")
 
-    print(f"\n完成！共生成 {len(results)} 个 DOCX 文件。")
+    print(f"\n完成！共处理 {total} 个文件夹。")
+
 
 if __name__ == "__main__":
     main()
